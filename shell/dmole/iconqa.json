@@ -1,0 +1,9 @@
+{
+    "iconqa": {
+        "root": ".",
+        "annotation": "data/iconqa/multi_text_choice_train.jsonl",
+        "data_augment": false,
+        "repeat_time": 5,
+        "length": 18946
+    }
+}

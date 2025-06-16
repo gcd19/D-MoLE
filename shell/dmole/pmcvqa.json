@@ -1,0 +1,9 @@
+{
+    "pmcvqa": {
+        "root": ".",
+        "annotation": "data/pmcvqa/train.jsonl",
+        "data_augment": false,
+        "repeat_time": 1,
+        "length": 176948
+    }
+}

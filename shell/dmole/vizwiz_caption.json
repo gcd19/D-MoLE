@@ -1,0 +1,9 @@
+{
+    "vizwiz-caption": {
+        "root": ".",
+        "annotation": "data/vizwiz-caption/train.jsonl",
+        "data_augment": false,
+        "repeat_time": 1,
+        "length": 117155
+    }
+}

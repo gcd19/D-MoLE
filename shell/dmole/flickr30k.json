@@ -1,0 +1,9 @@
+{
+    "flickr30k": {
+        "root": ".",
+        "annotation": "data/flickr30k/train.jsonl",
+        "data_augment": false,
+        "repeat_time": 1,
+        "length": 145000
+    }
+}
