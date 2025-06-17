@@ -45,9 +45,11 @@ conda install openjdk=8 -y  # for pycocoevalcap
 
 ## 📁 Data Preparation
 
-> **Note**: Datasets are currently being uploaded and will be available soon.
+### Download Datasets
 
-1. **Download datasets** and organize them in the following structure:
+📥 **[Download from Google Drive](https://drive.google.com/file/d/1Ai9u3rwNctyMF8k3v3N3AwGR5ax6pAjD/view?usp=drive_link)**
+
+1. **Download datasets** from the Google Drive link above and organize them in the following structure:
 ```
 data/
 ├── flickr30k/
@@ -140,7 +142,7 @@ If you use this code or find our work useful, please cite:
 
 ## 📬 Contact
 
-If you have any questions, feel free to open an issue or contact us at `[your-email@domain.com]`.
+If you have any questions, feel free to open an issue or contact the first author at `gcd23@mails.tsinghua.edu.cn`.
 
 ---
 
