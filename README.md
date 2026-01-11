@@ -47,7 +47,7 @@ conda install openjdk=8 -y  # for pycocoevalcap
 
 ### Download Datasets
 
-📥 **[Download from Google Drive](https://drive.google.com/file/d/1a3pKtWgkkWCiVRttQT8rMW9RvXYvZywh/view?usp=sharing)**
+📥 **[Download from Google Drive](https://drive.google.com/file/d/1NyUCf0jA0B-xfHXH7c5VZZDeEpL_TdzV/view?usp=sharing)**
 
 1. **Download datasets** from the Google Drive link above and organize them in the following structure:
 ```
