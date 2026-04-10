@@ -4,13 +4,15 @@
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
 
+import importlib.util
+import json
 import logging
 import math
 import os
 import sys
 import warnings
-from collections import defaultdict
 from functools import partial
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -66,6 +68,10 @@ from internvl.train.constants import (
 from internvl.train.dataset import build_datasets
 from internvl.train.dataset_packed import packed_collate_fn
 from internvl.train.trainer import CustomTrainer
+from internvl.scorer.score_policy import (
+    FALLBACK_SCORE_PROVENANCE,
+    STRICT_SCORE_PROVENANCE,
+)
 
 # Set constants for image processing and logging
 IGNORE_INDEX = -100
@@ -80,6 +86,57 @@ logger = logging.getLogger(__name__)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 MODEL_DTYPE_ENV = "DMOLE_MODEL_DTYPE"
+REQUIRE_LONESTAR_PHYSICS_ENV = "DMOLE_REQUIRE_LONESTAR_PHYSICS"
+FAIL_ON_SANITIZED_SCORE_ENV = "DMOLE_FAIL_ON_SANITIZED_SCORE"
+GEODESIC_TRUST_SCALE = 1.0
+SCORE_EPSILON = 1e-12
+
+LONESTAR_PHYSICS_EXTENSION_ENV = "LONESTAR_PHYSICS_EXTENSION"
+
+
+def load_lonestar_physics():
+    try:
+        import lonestar_physics as installed_lonestar_physics
+
+        return installed_lonestar_physics, "python-import"
+    except Exception:
+        pass
+
+    repo_root = Path(__file__).resolve().parents[2]
+    workspace_root = repo_root.parent
+    candidate_paths: list[Path] = []
+    explicit_path = os.environ.get(LONESTAR_PHYSICS_EXTENSION_ENV, "").strip()
+    if explicit_path:
+        candidate_paths.append(Path(explicit_path))
+    candidate_paths.extend(
+        [
+            workspace_root / "lonestar-physics" / "target" / "maturin" / "liblonestar_physics.so",
+            workspace_root / "lonestar-physics" / "target" / "release" / "liblonestar_physics.so",
+            workspace_root / "lonestar-physics" / "target" / "debug" / "liblonestar_physics.so",
+        ]
+    )
+
+    for candidate_path in candidate_paths:
+        if not candidate_path.is_file():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "lonestar_physics", candidate_path
+            )
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["lonestar_physics"] = module
+            spec.loader.exec_module(module)
+            return module, str(candidate_path)
+        except Exception:
+            sys.modules.pop("lonestar_physics", None)
+            continue
+
+    return None, None
+
+
+_lp, _lp_source = load_lonestar_physics()
 
 
 def resolve_model_dtype() -> torch.dtype:
@@ -119,6 +176,209 @@ def len2weight(x, loss_reduction):
     if loss_reduction == "square":
         return 1 / (x**0.5)
     raise NotImplementedError(loss_reduction)
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def require_lonestar_physics() -> None:
+    if env_flag(REQUIRE_LONESTAR_PHYSICS_ENV) and _lp is None:
+        raise RuntimeError(
+            "LoneStarPhysics invariance scoring is required but lonestar_physics "
+            "could not be imported or loaded from an authoritative extension artifact."
+        )
+
+
+def score_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return max(dist.get_world_size(), 1)
+    return max(torch.cuda.device_count(), 1)
+
+
+def layer_modality(layer_name: str) -> str:
+    if "language_model" in layer_name:
+        return "language_model"
+    if "vision_model" in layer_name:
+        return "vision_model"
+    return "other"
+
+
+def normalize_distribution(values: list[float]) -> list[float] | None:
+    total = math.fsum(values)
+    if not math.isfinite(total) or total <= 0.0:
+        return None
+    return [max(value, 0.0) / total for value in values]
+
+
+def collect_batch_layer_scores(model, target_modules: list[str]) -> tuple[dict[str, float], set[str]]:
+    batch_scores: dict[str, float] = {}
+    sanitized_layers: set[str] = set()
+
+    for name, module in model.named_modules():
+        if not any(name.endswith(target) for target in target_modules):
+            continue
+        total_norm = 0.0
+        for param in module.parameters():
+            if param.grad is None:
+                continue
+            grad = param.grad.detach()
+            if not torch.isfinite(grad).all():
+                grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+                sanitized_layers.add(name)
+            total_norm += grad.norm().item()
+        batch_scores[name] = total_norm * score_world_size()
+    return batch_scores, sanitized_layers
+
+
+def summarize_modality_distributions(
+    modality_distributions: list[list[float]],
+) -> tuple[float, float]:
+    if not modality_distributions:
+        return 0.0, 0.0
+    if _lp is None:
+        return 0.0, 1.0
+
+    if len(modality_distributions) == 1:
+        return 0.0, 1.0
+
+    center = _lp.fisher_rao.frechet_mean(modality_distributions, 32)
+    variance = _lp.fisher_rao.frechet_variance(modality_distributions, center)
+    variance = 0.0 if variance is None else float(variance)
+    trust = float(
+        _lp.fisher_rao.distance_to_trust(
+            math.sqrt(max(variance, 0.0)),
+            GEODESIC_TRUST_SCALE,
+        )
+    )
+    return variance, trust
+
+
+def build_score_frame(
+    batch_layer_scores: list[dict[str, float]],
+    sanitized_layers: set[str],
+) -> tuple[DataFrame, dict[str, object]]:
+    if not batch_layer_scores:
+        raise RuntimeError("zero-cost proxy scoring produced no batches")
+
+    layer_names = sorted(
+        {
+            layer_name
+            for batch_scores in batch_layer_scores
+            for layer_name in batch_scores
+            if layer_modality(layer_name) != "other"
+        }
+    )
+    if not layer_names:
+        raise RuntimeError("zero-cost proxy scoring produced no eligible layer scores")
+
+    per_layer_history = {layer_name: [] for layer_name in layer_names}
+    modality_layers = {
+        "language_model": sorted(
+            [layer_name for layer_name in layer_names if layer_modality(layer_name) == "language_model"]
+        ),
+        "vision_model": sorted(
+            [layer_name for layer_name in layer_names if layer_modality(layer_name) == "vision_model"]
+        ),
+    }
+    modality_distributions = {"language_model": [], "vision_model": []}
+
+    for batch_scores in batch_layer_scores:
+        for layer_name in layer_names:
+            per_layer_history[layer_name].append(float(batch_scores.get(layer_name, 0.0)))
+
+        for modality_name, modality_layer_names in modality_layers.items():
+            if not modality_layer_names:
+                continue
+            raw_values = [
+                float(batch_scores.get(layer_name, 0.0))
+                for layer_name in modality_layer_names
+            ]
+            normalized = normalize_distribution(raw_values)
+            if normalized is not None:
+                modality_distributions[modality_name].append(normalized)
+
+    modality_summary: dict[str, dict[str, float]] = {}
+    for modality_name, distributions in modality_distributions.items():
+        variance, trust = summarize_modality_distributions(distributions)
+        modality_summary[modality_name] = {
+            "frechet_variance": float(variance),
+            "trust": float(trust),
+            "distribution_count": float(len(distributions)),
+        }
+
+    score_provenance = (
+        STRICT_SCORE_PROVENANCE if _lp is not None else FALLBACK_SCORE_PROVENANCE
+    )
+    records = []
+    for layer_name in layer_names:
+        modality_name = layer_modality(layer_name)
+        history = per_layer_history[layer_name]
+        raw_score = float(math.fsum(history))
+        share_history = []
+        modality_layer_names = modality_layers.get(modality_name, [])
+        for batch_scores in batch_layer_scores:
+            raw_values = [
+                float(batch_scores.get(name, 0.0))
+                for name in modality_layer_names
+            ]
+            normalized = normalize_distribution(raw_values)
+            if normalized is None:
+                share_history.append(0.0)
+                continue
+            share_history.append(
+                normalized[modality_layer_names.index(layer_name)]
+                if layer_name in modality_layer_names
+                else 0.0
+            )
+
+        share_mean = float(math.fsum(share_history) / len(share_history))
+        share_variance = float(
+            math.fsum((value - share_mean) ** 2 for value in share_history)
+            / len(share_history)
+        )
+        stability_penalty = share_variance / max(share_mean * share_mean, SCORE_EPSILON)
+        modality_trust = modality_summary.get(modality_name, {}).get("trust", 0.0)
+        modality_frechet_variance = modality_summary.get(modality_name, {}).get(
+            "frechet_variance", 0.0
+        )
+        authoritative_score = raw_score * modality_trust / (1.0 + stability_penalty)
+        if not math.isfinite(authoritative_score):
+            raise RuntimeError(
+                f"authoritative score became non-finite for layer {layer_name}"
+            )
+
+        records.append(
+            {
+                "layer": layer_name,
+                "score": authoritative_score,
+                "raw_score": raw_score,
+                "share_mean": share_mean,
+                "share_variance": share_variance,
+                "stability_penalty": stability_penalty,
+                "modality": modality_name,
+                "modality_trust": modality_trust,
+                "modality_frechet_variance": modality_frechet_variance,
+                "sanitized_nonfinite": layer_name in sanitized_layers,
+                "score_batches": len(history),
+                "score_provenance": score_provenance,
+            }
+        )
+
+    frame = DataFrame(records).sort_values(
+        by=["score", "raw_score", "layer"],
+        ascending=[False, False, True],
+        kind="mergesort",
+    )
+    manifest = {
+        "score_provenance": score_provenance,
+        "batch_count": len(batch_layer_scores),
+        "sanitized_layers": sorted(sanitized_layers),
+        "modality_summary": modality_summary,
+        "lonestar_physics_available": _lp is not None,
+        "lonestar_physics_source": _lp_source,
+    }
+    return frame, manifest
 
 
 def main():
@@ -418,6 +678,11 @@ def main():
 
     portion = model_args.zc_proxy_score_portion
     max_batch_num = int(len(train_dataloader) * portion + 0.5)
+    if max_batch_num <= 0:
+        raise RuntimeError(
+            "zc_proxy_score_portion is too small for the available dataloader; "
+            "no scoring batches would execute."
+        )
 
     logger.info(
         f"Zero-cost proxy score portion: {portion}, max_batch_num: {max_batch_num}"
@@ -425,55 +690,71 @@ def main():
 
     model = trainer._wrap_model(model).to(trainer.args.device)
 
+    require_lonestar_physics()
+    target_modules = ["attention.wqkv", "attention.wo", "attn.qkv", "attn.proj"]
     model.train()
     model.zero_grad()
+    supervised_token_total = 0
+    batch_layer_scores: list[dict[str, float]] = []
+    sanitized_layers: set[str] = set()
     for i, inputs in tqdm(enumerate(train_dataloader), total=max_batch_num):
         if i > max_batch_num:
             break
 
+        model.zero_grad(set_to_none=True)
         inputs = trainer._prepare_inputs(inputs)
         inputs = cast_floating_tensors(inputs, model_dtype)
+        supervised_tokens = int((inputs["labels"] != IGNORE_INDEX).sum().item())
+        if supervised_tokens <= 0:
+            raise RuntimeError(
+                "zero-cost proxy batch contains no supervised assistant tokens; "
+                "label masking collapsed and the score would be meaningless."
+            )
+        supervised_token_total += supervised_tokens
         loss = trainer.compute_loss(model, inputs)
 
         loss.backward()
+        if torch.distributed.get_rank() == 0:
+            current_batch_scores, current_sanitized = collect_batch_layer_scores(
+                model, target_modules
+            )
+            if current_batch_scores:
+                batch_layer_scores.append(current_batch_scores)
+            sanitized_layers.update(current_sanitized)
 
     logger.info("Finished computing zero-shot proxy score.")
+    logger.info(f"Total supervised tokens used for proxy scoring: {supervised_token_total}")
 
     logger.info("Computing zero-shot proxy score for each layer...")
 
-    target_modules = ["attention.wqkv", "attention.wo", "attn.qkv", "attn.proj"]
-
     if torch.distributed.get_rank() == 0:
-        zc_proxy_score = defaultdict(float)
-
-        for name, module in model.named_modules():
-            if any([name.endswith(target) for target in target_modules]):
-                for param in module.parameters():
-                    if param.grad is not None:
-                        zc_proxy_score[name] += param.grad.norm().item()
-                zc_proxy_score[name] *= torch.cuda.device_count()
-
-        non_finite_layers = [
-            name for name, score in zc_proxy_score.items() if not math.isfinite(score)
-        ]
-        if non_finite_layers:
-            raise RuntimeError(
-                "zero-cost proxy score contains non-finite values for layers: "
-                + ", ".join(non_finite_layers[:10])
+        if sanitized_layers:
+            if env_flag(FAIL_ON_SANITIZED_SCORE_ENV):
+                raise RuntimeError(
+                    "zero-cost proxy scoring encountered non-finite gradients in "
+                    "strict mode for layers: "
+                    + ", ".join(sorted(sanitized_layers)[:10])
+                )
+            logger.warning(
+                "Sanitized non-finite gradients before proxy scoring for %d layers.",
+                len(sanitized_layers),
             )
 
-        # sorting by score
-        zc_proxy_score = sorted(
-            zc_proxy_score.items(), key=lambda x: x[1], reverse=True
+        df, manifest = build_score_frame(batch_layer_scores, sanitized_layers)
+        total_proxy_score = float(df["score"].sum())
+        if total_proxy_score <= 0:
+            logger.warning(
+                "authoritative score surface collapsed to zero; downstream strict "
+                "selection will fail closed unless explicitly downgraded"
+            )
+
+        output_path = Path(model_args.zc_proxy_score_save_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output_path, index=False)
+        output_path.with_suffix(".manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
-
-        # save to csv
-        os.makedirs(os.path.dirname(model_args.zc_proxy_score_save_path), exist_ok=True)
-
-        # note that zc_proxy_score is already a list, so we can directly use it
-        df = DataFrame(zc_proxy_score, columns=["layer", "score"])
-
-        df.to_csv(model_args.zc_proxy_score_save_path, index=False)
 
         logger.info("Finished computing zero-shot proxy score for each layer.")
 

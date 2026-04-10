@@ -13,10 +13,16 @@ export LAUNCHER="${LAUNCHER:-pytorch}"
 export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-3}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
 export DMOLE_MODEL_DTYPE="${DMOLE_MODEL_DTYPE:-float32}"
+export DMOLE_REQUIRE_LONESTAR_PHYSICS="${DMOLE_REQUIRE_LONESTAR_PHYSICS:-1}"
+export DMOLE_FAIL_ON_SANITIZED_SCORE="${DMOLE_FAIL_ON_SANITIZED_SCORE:-1}"
 BF16_FLAG="${DMOLE_BF16:-False}"
+SEQ_FORCE_IMAGE_SIZE="${DMOLE_SEQ_FORCE_IMAGE_SIZE:-224}"
+SEQ_MAX_DYNAMIC_PATCH="${DMOLE_SEQ_MAX_DYNAMIC_PATCH:-1}"
+SEQ_MAX_SEQ_LENGTH="${DMOLE_SEQ_MAX_SEQ_LENGTH:-1024}"
+SEQ_BATCH_SIZE="${DMOLE_SEQ_BATCH_SIZE:-1}"
 ZC_FORCE_IMAGE_SIZE="${DMOLE_ZC_FORCE_IMAGE_SIZE:-224}"
 ZC_MAX_DYNAMIC_PATCH="${DMOLE_ZC_MAX_DYNAMIC_PATCH:-1}"
-ZC_MAX_SEQ_LENGTH="${DMOLE_ZC_MAX_SEQ_LENGTH:-512}"
+ZC_MAX_SEQ_LENGTH="${DMOLE_ZC_MAX_SEQ_LENGTH:-1024}"
 ZC_BATCH_SIZE="${DMOLE_ZC_BATCH_SIZE:-1}"
 ZC_GRAD_CHECKPOINT="${DMOLE_ZC_GRAD_CHECKPOINT:-True}"
 
@@ -46,8 +52,62 @@ require_executable() {
   fi
 }
 
+require_python_module() {
+  local module_name="$1"
+  if ! "$PYTHON_BIN" - "$module_name" "${REPO_ROOT}" <<'PY'
+import importlib
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+def load_lonestar_physics_from_candidates(repo_root: Path) -> bool:
+    candidate_paths = []
+    explicit_path = os.environ.get("LONESTAR_PHYSICS_EXTENSION", "").strip()
+    if explicit_path:
+        candidate_paths.append(Path(explicit_path))
+    workspace_root = repo_root.parent
+    candidate_paths.extend(
+        [
+            workspace_root / "lonestar-physics" / "target" / "maturin" / "liblonestar_physics.so",
+            workspace_root / "lonestar-physics" / "target" / "release" / "liblonestar_physics.so",
+            workspace_root / "lonestar-physics" / "target" / "debug" / "liblonestar_physics.so",
+        ]
+    )
+    for candidate_path in candidate_paths:
+        if not candidate_path.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location("lonestar_physics", candidate_path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["lonestar_physics"] = module
+        spec.loader.exec_module(module)
+        return True
+    return False
+
+module_name = sys.argv[1]
+repo_root = Path(sys.argv[2]).resolve()
+
+try:
+    importlib.import_module(module_name)
+except Exception:
+    if module_name != "lonestar_physics" or not load_lonestar_physics_from_candidates(
+        repo_root
+    ):
+        raise
+PY
+  then
+    echo "FATAL: required Python module is unavailable: ${module_name}" >&2
+    exit 1
+  fi
+}
+
 require_executable "$PYTHON_BIN"
 require_file "${MODEL_PATH}/config.json"
+if [[ "${DMOLE_REQUIRE_LONESTAR_PHYSICS}" == "1" ]]; then
+  require_python_module "lonestar_physics"
+fi
 
 "$PYTHON_BIN" "${REPO_ROOT}/scripts/preprocess/reconstruct_public_dmole_assets.py" \
   --task vizwiz_caption \
@@ -65,8 +125,8 @@ require_file "${MODEL_PATH}/config.json"
   --output_dir none \
   --conv_style "internlm2-chat" \
   --meta_path "${META_PATH}" \
-  --force_image_size 448 \
-  --max_dynamic_patch 6 \
+  --force_image_size "${SEQ_FORCE_IMAGE_SIZE}" \
+  --max_dynamic_patch "${SEQ_MAX_DYNAMIC_PATCH}" \
   --down_sample_ratio 0.5 \
   --drop_path_rate 0.0 \
   --freeze_llm True \
@@ -75,8 +135,8 @@ require_file "${MODEL_PATH}/config.json"
   --vision_select_layer -1 \
   --bf16 "${BF16_FLAG}" \
   --num_train_epochs 1 \
-  --max_seq_length 2048 \
-  --per_device_train_batch_size 2
+  --max_seq_length "${SEQ_MAX_SEQ_LENGTH}" \
+  --per_device_train_batch_size "${SEQ_BATCH_SIZE}"
 
 require_file "${EMBEDDING_PATH}"
 
@@ -110,6 +170,7 @@ require_file "${EMBEDDING_PATH}"
   --zc_proxy_score_save_path "${SCORE_PATH}"
 
 require_file "${SCORE_PATH}"
+require_file "${SCORE_PATH%.csv}.manifest.json"
 
 "$PYTHON_BIN" "${REPO_ROOT}/scripts/preprocess/get_dmole_arch_single_task.py" \
   --task-name "${TASK_NAME}" \
