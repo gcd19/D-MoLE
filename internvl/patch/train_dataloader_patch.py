@@ -11,6 +11,19 @@ from torch.utils.data import DataLoader
 from transformers.trainer import is_datasets_available, seed_worker
 
 
+def _compat_seed_worker(worker_id: int):
+    try:
+        return seed_worker(worker_id)
+    except TypeError:
+        worker_info = torch.utils.data.get_worker_info()
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = 0
+        return seed_worker(worker_id, num_workers, rank)
+
+
 def get_train_dataloader(self) -> DataLoader:
     """
     Returns the training [`~torch.utils.data.DataLoader`].
@@ -41,7 +54,7 @@ def get_train_dataloader(self) -> DataLoader:
     if not isinstance(train_dataset, torch.utils.data.IterableDataset):
         dataloader_params['sampler'] = self._get_train_sampler()
         dataloader_params['drop_last'] = self.args.dataloader_drop_last
-        dataloader_params['worker_init_fn'] = seed_worker
+        dataloader_params['worker_init_fn'] = _compat_seed_worker
 
     if self.args.use_packed_ds:
         return DataLoader(train_dataset, **dataloader_params)

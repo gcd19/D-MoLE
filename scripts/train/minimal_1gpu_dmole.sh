@@ -17,11 +17,11 @@ BASE_MODEL_DIR="${DMOLE_BASE_MODEL_DIR:-${REPO_ROOT}/pretrained/InternVL2-2B}"
 DATA_DIR="${DMOLE_DATA_DIR:-${REPO_ROOT}/data}"
 ARCH_DIR="${DMOLE_ARCH_DIR:-${REPO_ROOT}/dmole_arch}"
 AUTOENCODER_DIR="${DMOLE_AUTOENCODER_DIR:-${REPO_ROOT}/autoencoder_models}"
-META_PATH="${DMOLE_META_PATH:-${REPO_ROOT}/shell/dmole/vizwiz_caption.json}"
+META_PATH="${DMOLE_META_PATH:-${REPO_ROOT}/shell/dmole_internal/vizwiz_caption_minimal.json}"
 TASK_NAME="${DMOLE_TASK_NAME:-vizwiz_caption}"
 OUTPUT_DIR="${OUTPUT_ROOT}/${TASK_NAME}_1gpu"
 DMOLE_ARCH_PATH="${DMOLE_ARCH_PATH:-${ARCH_DIR}/1_InternVL2-2B_${TASK_NAME}_arch.json}"
-TRAIN_LOG="${OUTPUT_DIR}/training_log.txt"
+TRAIN_LOG="${OUTPUT_ROOT}/${TASK_NAME}_1gpu_training.log"
 
 require_file() {
   local path="$1"
@@ -155,7 +155,6 @@ export OUTPUT_DIR TASK_NAME DMOLE_ARCH_PATH BASE_MODEL_DIR META_PATH
   --conv_style "internlm2-chat" \
   --output_dir "${OUTPUT_DIR}" \
   --meta_path "${META_PATH}" \
-  --overwrite_output_dir True \
   --force_image_size 448 \
   --max_dynamic_patch 6 \
   --down_sample_ratio 0.5 \
@@ -175,7 +174,7 @@ export OUTPUT_DIR TASK_NAME DMOLE_ARCH_PATH BASE_MODEL_DIR META_PATH
   --num_train_epochs 1 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
-  --evaluation_strategy "no" \
+  --eval_strategy "no" \
   --save_strategy "steps" \
   --save_steps 10 \
   --save_total_limit 1 \
@@ -187,7 +186,6 @@ export OUTPUT_DIR TASK_NAME DMOLE_ARCH_PATH BASE_MODEL_DIR META_PATH
   --max_seq_length 2048 \
   --do_train True \
   --grad_checkpoint True \
-  --group_by_length True \
   --dynamic_image_size True \
   --use_thumbnail True \
   --ps_version 'v2' \

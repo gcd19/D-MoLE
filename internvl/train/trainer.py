@@ -96,22 +96,34 @@ class CustomTrainer(Trainer):
         lora_state_dict = save_lora_weights(self.model, output_dir)
 
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+        self.model.config.save_pretrained(output_dir)
+
+        processing_class = getattr(self, "processing_class", None) or getattr(
+            self, "tokenizer", None
+        )
+        if processing_class is not None and hasattr(processing_class, "save_pretrained"):
+            processing_class.save_pretrained(output_dir)
 
         logger.info(
             f"Model configuration, LoRA weights, tokenizer, and metadata saved to {output_dir}"
         )
 
-        super()._save(output_dir, state_dict=lora_state_dict)
-
 
 class DMoLETrainer(CustomTrainer):
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        num_items_in_batch=None,
+    ):
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
         Subclass and override for custom behavior.
         """
+        del num_items_in_batch
         if self.label_smoother is not None and "labels" in inputs:
             labels = inputs.pop("labels")
         else:
@@ -128,6 +140,9 @@ class DMoLETrainer(CustomTrainer):
 
         if current_task_id is not None:
             try:
+                processing_class = getattr(self, "tokenizer", None) or getattr(
+                    self, "processing_class", None
+                )
                 # Set no experts for sequence representation computation
                 if hasattr(model, "module"):
                     model.module.set_expert_masks([])
@@ -139,7 +154,11 @@ class DMoLETrainer(CustomTrainer):
                 if labels is not None:
                     inputs_copy["labels"] = labels  # restore labels for process_inputs
 
-                new_inputs = process_inputs(inputs_copy, real_model, self.tokenizer)
+                new_inputs = process_inputs(
+                    inputs_copy,
+                    real_model,
+                    processing_class,
+                )
 
                 # get sequence representations
                 if hasattr(model, "module"):
@@ -174,7 +193,7 @@ class DMoLETrainer(CustomTrainer):
 
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
-        if self.args.past_index >= 0:
+        if getattr(self.args, "past_index", -1) >= 0:
             self._past = outputs[self.args.past_index]
 
         if labels is not None:

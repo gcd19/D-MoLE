@@ -133,10 +133,11 @@ def main():
 
     # Detecting last checkpoint and eventually continue from last checkpoint.
     last_checkpoint = None
+    overwrite_output_dir = getattr(training_args, "overwrite_output_dir", False)
     if (
         os.path.isdir(training_args.output_dir)
         and training_args.do_train
-        and not training_args.overwrite_output_dir
+        and not overwrite_output_dir
     ):
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
