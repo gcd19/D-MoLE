@@ -10,6 +10,7 @@ export MASTER_PORT="${MASTER_PORT:-34229}"
 export LAUNCHER="${LAUNCHER:-pytorch}"
 export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-3}"
 export ENABLE_EVALUATION="${ENABLE_EVALUATION:-false}"
+export DMOLE_REQUIRE_FINITE_TRAIN_SIGNAL="${DMOLE_REQUIRE_FINITE_TRAIN_SIGNAL:-1}"
 
 PYTHON_BIN="${DMOLE_ENV}/bin/python"
 OUTPUT_ROOT="${SOULFORGE_OUTPUT_DIR:?SOULFORGE_OUTPUT_DIR must be set}"
@@ -137,12 +138,76 @@ expert_payload = {
 PY
 }
 
+validate_training_signal() {
+  if [[ "${DMOLE_REQUIRE_FINITE_TRAIN_SIGNAL}" == "0" ]]; then
+    return 0
+  fi
+
+  "$PYTHON_BIN" - <<'PY'
+import ast
+import math
+import os
+from pathlib import Path
+
+train_log = Path(os.environ["TRAIN_LOG"])
+if not train_log.is_file():
+    raise SystemExit(f"FATAL: training log is missing: {train_log}")
+
+metric_rows = []
+for raw_line in train_log.read_text(encoding="utf-8", errors="replace").splitlines():
+    start = raw_line.find("{")
+    end = raw_line.rfind("}")
+    if start < 0 or end <= start:
+        continue
+    candidate = raw_line[start : end + 1]
+    try:
+        parsed = ast.literal_eval(candidate)
+    except (SyntaxError, ValueError):
+        continue
+    if isinstance(parsed, dict) and "loss" in parsed:
+        metric_rows.append(parsed)
+
+if not metric_rows:
+    raise SystemExit("FATAL: no per-step training metrics were captured in the training log.")
+
+finite_positive_loss = False
+nonfinite_grad_rows = []
+for row in metric_rows:
+    loss_value = row.get("loss")
+    grad_value = row.get("grad_norm")
+    try:
+        if math.isfinite(float(loss_value)) and float(loss_value) > 0.0:
+            finite_positive_loss = True
+    except (TypeError, ValueError):
+        pass
+    if grad_value is not None:
+        try:
+            grad_float = float(grad_value)
+        except (TypeError, ValueError):
+            nonfinite_grad_rows.append(row)
+        else:
+            if not math.isfinite(grad_float):
+                nonfinite_grad_rows.append(row)
+
+if not finite_positive_loss:
+    raise SystemExit(
+        "FATAL: degenerate training signal detected; no strictly positive finite loss was observed."
+    )
+
+if nonfinite_grad_rows:
+    raise SystemExit(
+        f"FATAL: non-finite grad_norm detected in {len(nonfinite_grad_rows)} logged step(s); "
+        "authoritative training evidence is invalid."
+    )
+PY
+}
+
 require_interpreter
 verify_runtime
 stage_checks
 
 mkdir -p "$OUTPUT_DIR"
-export OUTPUT_DIR TASK_NAME DMOLE_ARCH_PATH BASE_MODEL_DIR META_PATH
+export OUTPUT_DIR TASK_NAME DMOLE_ARCH_PATH BASE_MODEL_DIR META_PATH TRAIN_LOG
 
 "$PYTHON_BIN" -m torch.distributed.run \
   --nnodes=1 \
@@ -192,4 +257,5 @@ export OUTPUT_DIR TASK_NAME DMOLE_ARCH_PATH BASE_MODEL_DIR META_PATH
   --report_to "none" \
   2>&1 | tee "${TRAIN_LOG}"
 
+validate_training_signal
 write_receipts
