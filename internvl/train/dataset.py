@@ -1239,76 +1239,123 @@ def preprocess_internlm(
         num_image: int = 1
 ) -> Dict:
     conv = get_conv_template(template_name)
-    roles = {'human': conv.roles[0], 'gpt': conv.roles[1]}
+    add_bos_token = getattr(tokenizer, 'add_bos_token', False)
+    assistant_prefix_ids = tokenizer(
+        conv.roles[1], return_tensors='np'
+    ).input_ids[0]
+    assistant_prefix_len = (
+        assistant_prefix_ids.shape[0] - 1 if add_bos_token else assistant_prefix_ids.shape[0]
+    )
 
-    # Apply prompt templates
-    conversations = []
+    batch_input_ids = []
+    batch_targets = []
+
     for i, source in enumerate(sources):
-        if roles[source[0]['from']] != conv.roles[0]:
-            # Skip the first one if it is not from human
-            source = source[1:]
+        working_source = deepcopy(source)
+        system_prompt = conv.system_message
+        if working_source and working_source[0]['from'] == 'system':
+            system_prompt = working_source[0]['value'].strip()
+            working_source = working_source[1:]
+        elif working_source and working_source[0]['from'] != 'human':
+            working_source = working_source[1:]
 
-        conv.messages = []
-        for j, sentence in enumerate(source):
-            role = roles[sentence['from']]
-            assert role == conv.roles[j % 2], f'{i}'
-            sentence['value'] = sentence['value'].strip()
-            conv.append_message(role, sentence['value'])
-        conversations.append(conv.get_prompt())
+        batches = []
+        roles = []
+        if system_prompt is not None:
+            batches.append(
+                f"{conv.system_template.format(system_message=system_prompt)}{conv.sep}\n"
+            )
+            roles.append('system')
 
-    if not text_only:
-        new_conversations = []
-        for conversation in conversations:
-            for i in range(num_image):
-                image_tokens = f'{IMG_START_TOKEN}{IMG_CONTEXT_TOKEN * num_image_token_list[i]}{IMG_END_TOKEN}'
-                conversation = conversation.replace('<image>', image_tokens, 1)
-            new_conversations.append(conversation)
-        conversations = new_conversations
+        current_image_idx = 0
+        for j, sentence in enumerate(working_source):
+            role = sentence['from']
+            value = sentence['value'].strip()
+            expected_role = 'human' if j % 2 == 0 else 'gpt'
+            assert role == expected_role, f'{i}'
 
-    # Tokenize conversations
-    input_ids = tokenizer(
-        conversations,
-        return_tensors='pt',
-        padding=False if group_by_length or use_packed_ds else 'max_length',
-        max_length=tokenizer.model_max_length,
-        truncation=True,
-    ).input_ids
-    targets = input_ids.clone()
+            if not text_only and role == 'human':
+                image_cnt = value.count('<image>')
+                for _ in range(image_cnt):
+                    if current_image_idx == num_image:
+                        break
+                    image_tokens = (
+                        f'{IMG_START_TOKEN}'
+                        f'{IMG_CONTEXT_TOKEN * num_image_token_list[current_image_idx]}'
+                        f'{IMG_END_TOKEN}'
+                    )
+                    value = value.replace('<image>', image_tokens, 1)
+                    current_image_idx += 1
 
-    for conversation, target in zip(conversations, targets):
-        total_len = int(target.ne(tokenizer.pad_token_id).sum())  # 浦语里面 pad_token_id = eos_token_id
-        cur_len = 1
-        target[:cur_len] = IGNORE_TOKEN_ID  # <s>
-        parts = conversation.split(conv.roles[1])  # [UNUSED_TOKEN_146]assistant\n
-        info = parts[0] + conv.roles[1]
-        temp_len = len(tokenizer(info).input_ids) - 1  # 去除tokenizer的<s>
-        target[cur_len: cur_len + temp_len] = IGNORE_TOKEN_ID
-        cur_len = cur_len + temp_len
+            if role == 'human':
+                batches.append(f'{conv.roles[0]}{value}{conv.sep}\n')
+                roles.append('human')
+            elif role == 'gpt':
+                batches.append(f'{conv.roles[1]}{value}{conv.sep}\n')
+                roles.append('gpt')
+            else:
+                raise NotImplementedError(role)
 
-        for index in range(1, len(parts) - 1):
-            info = parts[index]
-            part1, part2 = info.split(conv.roles[0])
-            temp_len = len(tokenizer(part1).input_ids) - 1
-            cur_len = cur_len + temp_len
-            part = conv.roles[0] + part2 + conv.roles[1]
-            temp_len = len(tokenizer(part).input_ids) - 1
-            target[cur_len: cur_len + temp_len] = IGNORE_TOKEN_ID
-            cur_len = cur_len + temp_len
-        last_info = parts[-1]
-        temp_len = len(tokenizer(last_info).input_ids) - 1
-        cur_len = cur_len + temp_len
+        if not text_only:
+            assert current_image_idx == num_image, f'{current_image_idx} != {num_image}'
 
-        target[cur_len:] = IGNORE_TOKEN_ID
-        if False:  # Inspect and check the correctness of masking
-            z = target.clone()
-            z = torch.where(z == IGNORE_TOKEN_ID, tokenizer.unk_token_id, z)
-            print(repr(tokenizer.decode(z)))
+        if add_bos_token and batches:
+            batches[0] = tokenizer.bos_token + batches[0]
 
-        if cur_len < tokenizer.model_max_length:
-            if cur_len != total_len:
-                target[:] = IGNORE_TOKEN_ID
-                print(f'WARNING: tokenization mismatch: {cur_len} vs. {total_len}. This dataset is {ds_name}.')
-                sys.stdout.flush()
+        tokenized_batches = tokenizer(
+            batches,
+            return_tensors='np',
+            padding=False,
+            max_length=tokenizer.model_max_length,
+            truncation=False,
+        ).input_ids
+
+        if add_bos_token:
+            tokenized_batches = [item[1:] for item in tokenized_batches]
+
+        final_input_ids = []
+        final_targets = []
+        for role, input_id in zip(roles, tokenized_batches):
+            final_input_ids.append(input_id)
+            if role in {'system', 'human'}:
+                final_targets.append(np.full(input_id.shape, IGNORE_TOKEN_ID))
+            elif role == 'gpt':
+                target = input_id.copy()
+                target[:assistant_prefix_len] = IGNORE_TOKEN_ID
+                target[-1:] = IGNORE_TOKEN_ID
+                final_targets.append(target)
+            else:
+                raise NotImplementedError(role)
+
+        input_tensor = torch.tensor(np.concatenate(final_input_ids))[:tokenizer.model_max_length]
+        target_tensor = torch.tensor(np.concatenate(final_targets))[:tokenizer.model_max_length]
+        batch_input_ids.append(input_tensor)
+        batch_targets.append(target_tensor)
+
+    pad_sequence = torch.nn.utils.rnn.pad_sequence
+    input_ids = pad_sequence(
+        batch_input_ids,
+        batch_first=True,
+        padding_value=tokenizer.pad_token_id,
+    )
+    targets = pad_sequence(
+        batch_targets,
+        batch_first=True,
+        padding_value=IGNORE_TOKEN_ID,
+    )
+
+    if not group_by_length and not use_packed_ds:
+        if input_ids.size(1) < tokenizer.model_max_length:
+            input_ids = F.pad(
+                input_ids,
+                (0, tokenizer.model_max_length - input_ids.size(1)),
+                value=tokenizer.pad_token_id,
+            )
+            targets = F.pad(
+                targets,
+                (0, tokenizer.model_max_length - targets.size(1)),
+                value=IGNORE_TOKEN_ID,
+            )
 
     return dict(
         input_ids=input_ids,
