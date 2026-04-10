@@ -80,6 +80,11 @@ def save_lora_weights(
 
 
 class CustomTrainer(Trainer):
+    def __init__(self, *args, tokenizer=None, processing_class=None, **kwargs):
+        if processing_class is None and tokenizer is not None:
+            processing_class = tokenizer
+        super().__init__(*args, processing_class=processing_class, **kwargs)
+
     def _save(self, output_dir: str, state_dict=None):
         if (
             not self.model.config.use_llm_lora

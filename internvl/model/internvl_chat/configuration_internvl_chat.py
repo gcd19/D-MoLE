@@ -53,25 +53,37 @@ class InternVLChatConfig(PretrainedConfig):
             )
 
         if llm_config is None:
-            # TODO: There might still be a bug in transformers version 4.44 and above.
-            llm_config = {"architectures": [""]}
+            llm_config = InternLM2Config().to_dict()
+            llm_config["architectures"] = ["InternLM2ForCausalLM"]
             logger.info(
-                "llm_config is None. Initializing the LlamaConfig config with default values (`LlamaConfig`)."
+                "llm_config is None. Initializing the InternLM2Config with default values."
             )
 
+        architectures = llm_config.get("architectures") or [""]
+        if not architectures[0]:
+            architecture_by_model_type = {
+                "llama": "LlamaForCausalLM",
+                "internlm2": "InternLM2ForCausalLM",
+                "phi3": "Phi3ForCausalLM",
+                "qwen2": "Qwen2ForCausalLM",
+            }
+            inferred_architecture = architecture_by_model_type.get(
+                llm_config.get("model_type"), "InternLM2ForCausalLM"
+            )
+            llm_config = {**llm_config, "architectures": [inferred_architecture]}
+            architectures = llm_config["architectures"]
+
         self.vision_config = InternVisionConfig(**vision_config)
-        if llm_config["architectures"][0] == "LlamaForCausalLM":
+        if architectures[0] == "LlamaForCausalLM":
             self.llm_config = LlamaConfig(**llm_config)
-        elif llm_config["architectures"][0] == "InternLM2ForCausalLM":
+        elif architectures[0] == "InternLM2ForCausalLM":
             self.llm_config = InternLM2Config(**llm_config)
-        elif llm_config["architectures"][0] == "Phi3ForCausalLM":
+        elif architectures[0] == "Phi3ForCausalLM":
             self.llm_config = Phi3Config(**llm_config)
-        elif llm_config["architectures"][0] == "Qwen2ForCausalLM":
+        elif architectures[0] == "Qwen2ForCausalLM":
             self.llm_config = Qwen2Config(**llm_config)
         else:
-            raise ValueError(
-                "Unsupported architecture: {}".format(llm_config["architectures"][0])
-            )
+            raise ValueError("Unsupported architecture: {}".format(architectures[0]))
         self.use_backbone_lora = use_backbone_lora
         self.use_llm_lora = use_llm_lora
         self.pad2square = pad2square

@@ -5,6 +5,7 @@
 # --------------------------------------------------------
 
 import logging
+import math
 import os
 import sys
 import warnings
@@ -78,6 +79,34 @@ warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+MODEL_DTYPE_ENV = "DMOLE_MODEL_DTYPE"
+
+
+def resolve_model_dtype() -> torch.dtype:
+    raw_dtype = os.environ.get(MODEL_DTYPE_ENV, "bfloat16").strip().lower()
+    mapping = {
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "float16": torch.float16,
+    }
+    if raw_dtype not in mapping:
+        raise ValueError(
+            f"Unsupported {MODEL_DTYPE_ENV}={raw_dtype!r}; "
+            "expected one of: bfloat16, float32, float16."
+        )
+    return mapping[raw_dtype]
+
+
+def cast_floating_tensors(value, dtype: torch.dtype):
+    if isinstance(value, torch.Tensor):
+        return value.to(dtype=dtype) if value.is_floating_point() else value
+    if isinstance(value, dict):
+        return {key: cast_floating_tensors(item, dtype) for key, item in value.items()}
+    if isinstance(value, list):
+        return [cast_floating_tensors(item, dtype) for item in value]
+    if isinstance(value, tuple):
+        return tuple(cast_floating_tensors(item, dtype) for item in value)
+    return value
 
 
 def len2weight(x, loss_reduction):
@@ -147,6 +176,8 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
+    model_dtype = resolve_model_dtype()
+    logger.info(f"Using model dtype: {model_dtype}")
 
     # Load pretrained model, tokenizer, and image processor
     tokenizer_path = model_args.model_name_or_path or model_args.llm_path
@@ -209,14 +240,14 @@ def main():
         config.min_dynamic_patch = data_args.min_dynamic_patch
         config.max_dynamic_patch = data_args.max_dynamic_patch
         model = InternVLChatModel.from_pretrained(
-            model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config
+            model_args.model_name_or_path, torch_dtype=model_dtype, config=config
         )
     else:
         logger.info("Loading ViT-6B...")
         vision_config = InternVisionConfig.from_pretrained(model_args.vision_path)
         vision_config.drop_path_rate = model_args.drop_path_rate
         vision_model = InternVisionModel.from_pretrained(
-            model_args.vision_path, torch_dtype=torch.bfloat16, config=vision_config
+            model_args.vision_path, torch_dtype=model_dtype, config=vision_config
         )
         logger.info("Loading LLaMA...")
         llm_config = AutoConfig.from_pretrained(
@@ -232,7 +263,7 @@ def main():
             logger.info("Using flash_attention_2 for LLaMA")
         llm = model_type.from_pretrained(
             model_args.llm_path,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=model_dtype,
             config=llm_config,
             trust_remote_code=True,
         )
@@ -305,11 +336,13 @@ def main():
     if model_args.grad_checkpoint:
         model.language_model._set_gradient_checkpointing()
 
+    group_by_length = getattr(training_args, "group_by_length", False)
+
     train_dataset = build_datasets(
         data_args,
         tokenizer,
         model,
-        group_by_length=training_args.group_by_length,
+        group_by_length=group_by_length,
         dynamic_image_size=data_args.dynamic_image_size,
         use_thumbnail=data_args.use_thumbnail,
         min_dynamic_patch=data_args.min_dynamic_patch,
@@ -399,6 +432,7 @@ def main():
             break
 
         inputs = trainer._prepare_inputs(inputs)
+        inputs = cast_floating_tensors(inputs, model_dtype)
         loss = trainer.compute_loss(model, inputs)
 
         loss.backward()
@@ -418,6 +452,15 @@ def main():
                     if param.grad is not None:
                         zc_proxy_score[name] += param.grad.norm().item()
                 zc_proxy_score[name] *= torch.cuda.device_count()
+
+        non_finite_layers = [
+            name for name, score in zc_proxy_score.items() if not math.isfinite(score)
+        ]
+        if non_finite_layers:
+            raise RuntimeError(
+                "zero-cost proxy score contains non-finite values for layers: "
+                + ", ".join(non_finite_layers[:10])
+            )
 
         # sorting by score
         zc_proxy_score = sorted(

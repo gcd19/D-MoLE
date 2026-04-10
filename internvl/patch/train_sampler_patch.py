@@ -103,11 +103,18 @@ def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
     if self.train_dataset is None or not has_length(self.train_dataset):
         return None
     # Build the sampler.
-    if self.args.group_by_length:
+    if getattr(self.args, 'group_by_length', False):
         lengths = []
         for dataset in self.train_dataset.datasets:
             lengths = lengths + dataset.length
-        model_input_name = self.tokenizer.model_input_names[0] if self.tokenizer is not None else None
+        processing_class = getattr(self, 'tokenizer', None) or getattr(
+            self, 'processing_class', None
+        )
+        model_input_name = (
+            processing_class.model_input_names[0]
+            if processing_class is not None
+            else None
+        )
         return LengthGroupedSampler(
             self.args.train_batch_size,
             world_size=self.args.world_size * self.args.gradient_accumulation_steps,

@@ -272,11 +272,13 @@ def main():
     if model_args.grad_checkpoint:
         model.language_model._set_gradient_checkpointing()
 
+    group_by_length = getattr(training_args, "group_by_length", False)
+
     train_dataset = build_datasets(
         data_args,
         tokenizer,
         model,
-        group_by_length=training_args.group_by_length,
+        group_by_length=group_by_length,
         dynamic_image_size=data_args.dynamic_image_size,
         use_thumbnail=data_args.use_thumbnail,
         min_dynamic_patch=data_args.min_dynamic_patch,

@@ -48,6 +48,7 @@ class InternVLChatModel(PreTrainedModel):
     config_class = InternVLChatConfig
     main_input_name = "pixel_values"
     base_model_prefix = "language_model"
+    all_tied_weights_keys = {}
     _no_split_modules = [
         "InternVisionModel",
         "LlamaDecoderLayer",
@@ -641,7 +642,8 @@ class InternVLChatModel(PreTrainedModel):
         return x
 
     def extract_feature(self, pixel_values):
-        pixel_values = pixel_values.to(torch.bfloat16)
+        vision_dtype = self.vision_model.embeddings.patch_embedding.weight.dtype
+        pixel_values = pixel_values.to(vision_dtype)
         if self.select_layer == -1:
             vit_embeds = self.vision_model(
                 pixel_values=pixel_values, output_hidden_states=False, return_dict=True
