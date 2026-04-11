@@ -12,6 +12,13 @@ export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-3}"
 export ENABLE_EVALUATION="${ENABLE_EVALUATION:-false}"
 export DMOLE_REQUIRE_FINITE_TRAIN_SIGNAL="${DMOLE_REQUIRE_FINITE_TRAIN_SIGNAL:-1}"
 export DMOLE_REQUIRE_FINITE_INITIAL_SIGNAL="${DMOLE_REQUIRE_FINITE_INITIAL_SIGNAL:-1}"
+export DMOLE_FORCE_TORCH_DTYPE="${DMOLE_FORCE_TORCH_DTYPE:-float32}"
+export DMOLE_FORCE_ATTN_IMPLEMENTATION="${DMOLE_FORCE_ATTN_IMPLEMENTATION:-eager}"
+export DMOLE_ENABLE_BF16="${DMOLE_ENABLE_BF16:-0}"
+BF16_FLAG="False"
+if [[ "${DMOLE_ENABLE_BF16}" == "1" ]]; then
+  BF16_FLAG="True"
+fi
 
 PYTHON_BIN="${DMOLE_ENV}/bin/python"
 OUTPUT_ROOT="${SOULFORGE_OUTPUT_DIR:?SOULFORGE_OUTPUT_DIR must be set}"
@@ -223,7 +230,9 @@ probe_initial_signal() {
     --use-llm-lora 8 \
     --use-backbone-lora 8 \
     --task-id 1 \
-    --max-seq-length 2048
+    --max-seq-length 2048 \
+    --torch-dtype "${DMOLE_FORCE_TORCH_DTYPE}" \
+    --attn-implementation "${DMOLE_FORCE_ATTN_IMPLEMENTATION}"
 }
 
 require_interpreter
@@ -261,7 +270,7 @@ probe_initial_signal
   --task_id 1 \
   --vision_select_layer -1 \
   --dataloader_num_workers 1 \
-  --bf16 True \
+  --bf16 "${BF16_FLAG}" \
   --num_train_epochs 1 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \

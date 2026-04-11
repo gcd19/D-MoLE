@@ -66,6 +66,29 @@ logger = logging.getLogger(__name__)
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 
+def _resolve_dmole_precision_policy():
+    dtype_name = os.environ.get("DMOLE_FORCE_TORCH_DTYPE", "bfloat16").strip().lower()
+    attn_impl = os.environ.get(
+        "DMOLE_FORCE_ATTN_IMPLEMENTATION", "flash_attention_2"
+    ).strip()
+
+    dtype_map = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    if dtype_name not in dtype_map:
+        raise ValueError(
+            f"Unsupported DMOLE_FORCE_TORCH_DTYPE={dtype_name!r}; expected one of "
+            "'float32', 'fp32', 'bfloat16', or 'bf16'."
+        )
+    if not attn_impl:
+        raise ValueError("DMOLE_FORCE_ATTN_IMPLEMENTATION must not be empty.")
+
+    return dtype_name, dtype_map[dtype_name], attn_impl
+
+
 def len2weight(x, loss_reduction):
     if x == 0:
         return x
@@ -199,14 +222,15 @@ def main():
         # apply_liger_kernel_to_internvit()
 
     logger.info("Loading InternVLChatModel...")
+    dtype_name, model_torch_dtype, attn_implementation = _resolve_dmole_precision_policy()
     config = InternVLChatConfig.from_pretrained(model_args.model_name_or_path)
     config.vision_config.drop_path_rate = model_args.drop_path_rate
     if config.llm_config.model_type == "internlm2":
-        config.llm_config.attn_implementation = "flash_attention_2"  # for InternLM
-        logger.info("Using flash_attention_2 for InternLM")
+        config.llm_config.attn_implementation = attn_implementation  # for InternLM
+        logger.info("Using %s attention for InternLM", attn_implementation)
     else:
-        config.llm_config._attn_implementation = "flash_attention_2"  # for LLaMA
-        logger.info("Using flash_attention_2 for LLaMA")
+        config.llm_config._attn_implementation = attn_implementation  # for LLaMA
+        logger.info("Using %s attention for LLaMA", attn_implementation)
     config.template = data_args.conv_style
     config.select_layer = model_args.vision_select_layer
     config.dynamic_image_size = data_args.dynamic_image_size
@@ -219,8 +243,9 @@ def main():
     config.autoencoder_path = model_args.autoencoder_path
     config.task_id = model_args.task_id
     model = InternVLChatModel.from_pretrained(
-        model_args.model_name_or_path, torch_dtype=torch.bfloat16, config=config
+        model_args.model_name_or_path, torch_dtype=model_torch_dtype, config=config
     )
+    logger.info("Using model torch dtype: %s", dtype_name)
     model.img_context_token_id = img_context_token_id
 
     assert model.config.downsample_ratio == data_args.down_sample_ratio

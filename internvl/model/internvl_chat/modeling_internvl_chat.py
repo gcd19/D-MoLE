@@ -926,8 +926,12 @@ class InternVLChatModel(PreTrainedModel):
         # Calculate MSE scores
         for idx in range(available_autoencoders):
             autoencoder = self.autoencoders[idx].to(seq_reps.device)
-            reconstructions = autoencoder(seq_reps).bfloat16()
-            per_element_loss = mse_loss(reconstructions, seq_reps)
+            autoencoder_dtype = next(autoencoder.parameters()).dtype
+            seq_reps_for_autoencoder = seq_reps.to(dtype=autoencoder_dtype)
+            reconstructions = autoencoder(seq_reps_for_autoencoder)
+            per_element_loss = mse_loss(
+                reconstructions.float(), seq_reps_for_autoencoder.float()
+            )
             per_sample_mse = per_element_loss.mean(dim=1)
             mse_scores[:, idx] = per_sample_mse.detach().cpu().float().numpy()
 

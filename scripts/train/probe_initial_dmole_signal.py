@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -49,7 +50,27 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-backbone-lora", type=int, default=8)
     parser.add_argument("--task-id", type=int, default=1)
     parser.add_argument("--max-seq-length", type=int, default=2048)
+    parser.add_argument(
+        "--torch-dtype",
+        default="bfloat16",
+        choices=("float32", "fp32", "bfloat16", "bf16"),
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        default="flash_attention_2",
+    )
     return parser
+
+
+def _resolve_torch_dtype(dtype_name: str) -> tuple[str, torch.dtype]:
+    normalized = dtype_name.strip().lower()
+    dtype_map = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    return normalized, dtype_map[normalized]
 
 
 def _configure_tokenizer(model_path: str, max_seq_length: int):
@@ -82,11 +103,12 @@ def _configure_model(
     num_new_tokens: int,
     img_context_token_id: int,
 ):
+    normalized_dtype_name, torch_dtype = _resolve_torch_dtype(args.torch_dtype)
     config = InternVLChatConfig.from_pretrained(args.model_name_or_path)
     if config.llm_config.model_type == "internlm2":
-        config.llm_config.attn_implementation = "flash_attention_2"
+        config.llm_config.attn_implementation = args.attn_implementation
     else:
-        config.llm_config._attn_implementation = "flash_attention_2"
+        config.llm_config._attn_implementation = args.attn_implementation
     config.template = args.conv_style
     config.select_layer = -1
     config.dynamic_image_size = True
@@ -101,7 +123,7 @@ def _configure_model(
 
     model = InternVLChatModel.from_pretrained(
         args.model_name_or_path,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch_dtype,
         config=config,
     )
     model.img_context_token_id = img_context_token_id
@@ -153,10 +175,10 @@ def _configure_model(
     model.vision_model.set_expert_masks(args.task_id)
     model.vision_model.freeze_old_experts(args.task_id)
     model.train()
-    return model.cuda()
+    return model.cuda(), normalized_dtype_name, torch_dtype
 
 
-def _build_batch(args: argparse.Namespace, tokenizer, model):
+def _build_batch(args: argparse.Namespace, tokenizer, model, batch_torch_dtype: torch.dtype):
     data_args = DataTrainingArguments(
         max_seq_length=args.max_seq_length,
         force_image_size=args.force_image_size,
@@ -187,7 +209,7 @@ def _build_batch(args: argparse.Namespace, tokenizer, model):
     for key, value in list(batch.items()):
         if isinstance(value, torch.Tensor):
             if key == "pixel_values":
-                batch[key] = value.to(device="cuda", dtype=torch.bfloat16)
+                batch[key] = value.to(device="cuda", dtype=batch_torch_dtype)
             else:
                 batch[key] = value.to(device="cuda")
     return batch
@@ -199,10 +221,17 @@ def _compute_probe_report(args: argparse.Namespace) -> dict:
         args.model_name_or_path,
         args.max_seq_length,
     )
-    model = _configure_model(args, tokenizer, num_new_tokens, img_context_token_id)
-    batch = _build_batch(args, tokenizer, model)
+    model, normalized_dtype_name, batch_torch_dtype = _configure_model(
+        args, tokenizer, num_new_tokens, img_context_token_id
+    )
+    batch = _build_batch(args, tokenizer, model, batch_torch_dtype)
 
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    autocast_context = (
+        torch.autocast(device_type="cuda", dtype=batch_torch_dtype)
+        if batch_torch_dtype == torch.bfloat16
+        else nullcontext()
+    )
+    with autocast_context:
         outputs = model(**batch)
     loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
     report = {
@@ -210,6 +239,8 @@ def _compute_probe_report(args: argparse.Namespace) -> dict:
         "meta_path": args.meta_path,
         "dmole_arch_path": args.dmole_arch_path,
         "autoencoder_path": args.autoencoder_path,
+        "torch_dtype": normalized_dtype_name,
+        "attn_implementation": args.attn_implementation,
         "input_ids_shape": list(batch["input_ids"].shape),
         "labels_shape": list(batch["labels"].shape),
         "pixel_values_shape": list(batch["pixel_values"].shape),
