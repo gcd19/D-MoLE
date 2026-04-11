@@ -11,6 +11,7 @@ export LAUNCHER="${LAUNCHER:-pytorch}"
 export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-3}"
 export ENABLE_EVALUATION="${ENABLE_EVALUATION:-false}"
 export DMOLE_REQUIRE_FINITE_TRAIN_SIGNAL="${DMOLE_REQUIRE_FINITE_TRAIN_SIGNAL:-1}"
+export DMOLE_REQUIRE_FINITE_INITIAL_SIGNAL="${DMOLE_REQUIRE_FINITE_INITIAL_SIGNAL:-1}"
 
 PYTHON_BIN="${DMOLE_ENV}/bin/python"
 OUTPUT_ROOT="${SOULFORGE_OUTPUT_DIR:?SOULFORGE_OUTPUT_DIR must be set}"
@@ -23,6 +24,7 @@ TASK_NAME="${DMOLE_TASK_NAME:-vizwiz_caption}"
 OUTPUT_DIR="${OUTPUT_ROOT}/${TASK_NAME}_1gpu"
 DMOLE_ARCH_PATH="${DMOLE_ARCH_PATH:-${ARCH_DIR}/1_InternVL2-2B_${TASK_NAME}_arch.json}"
 TRAIN_LOG="${OUTPUT_ROOT}/${TASK_NAME}_1gpu_training.log"
+SIGNAL_PROBE_JSON="${OUTPUT_ROOT}/${TASK_NAME}_initial_signal_probe.json"
 
 require_file() {
   local path="$1"
@@ -202,12 +204,36 @@ if nonfinite_grad_rows:
 PY
 }
 
+probe_initial_signal() {
+  if [[ "${DMOLE_REQUIRE_FINITE_INITIAL_SIGNAL}" == "0" ]]; then
+    return 0
+  fi
+
+  "$PYTHON_BIN" "${REPO_ROOT}/scripts/train/probe_initial_dmole_signal.py" \
+    --model-name-or-path "${BASE_MODEL_DIR}" \
+    --meta-path "${META_PATH}" \
+    --dmole-arch-path "${DMOLE_ARCH_PATH}" \
+    --autoencoder-path "${AUTOENCODER_DIR}" \
+    --output-json "${SIGNAL_PROBE_JSON}" \
+    --force-image-size 448 \
+    --down-sample-ratio 0.5 \
+    --conv-style "internlm2-chat" \
+    --min-dynamic-patch 1 \
+    --max-dynamic-patch 6 \
+    --use-llm-lora 8 \
+    --use-backbone-lora 8 \
+    --task-id 1 \
+    --max-seq-length 2048
+}
+
 require_interpreter
 verify_runtime
 stage_checks
 
 mkdir -p "$OUTPUT_DIR"
-export OUTPUT_DIR TASK_NAME DMOLE_ARCH_PATH BASE_MODEL_DIR META_PATH TRAIN_LOG
+export OUTPUT_DIR TASK_NAME DMOLE_ARCH_PATH BASE_MODEL_DIR META_PATH TRAIN_LOG SIGNAL_PROBE_JSON
+
+probe_initial_signal
 
 "$PYTHON_BIN" -m torch.distributed.run \
   --nnodes=1 \
